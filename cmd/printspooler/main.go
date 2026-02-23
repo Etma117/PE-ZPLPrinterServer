@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -396,7 +397,12 @@ func printTicket(cfg Config, jobID int64, doc TicketDoc) error {
 		}
 		return nil
 	case "command":
-		cmd := exec.Command("sh", "-c", cfg.PrintCommand)
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			cmd = exec.Command("cmd", "/c", cfg.PrintCommand)
+		} else {
+			cmd = exec.Command("sh", "-c", cfg.PrintCommand)
+		}
 		switch strings.ToLower(cfg.RenderMode) {
 		case "escpos":
 			cmd.Stdin = bytes.NewReader(doc.ESCPos)
