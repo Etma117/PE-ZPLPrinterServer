@@ -400,7 +400,7 @@ func printTicket(cfg Config, jobID int64, doc TicketDoc) error {
 	case "command":
 		var cmd *exec.Cmd
 		if runtime.GOOS == "windows" {
-			cmd = exec.Command("cmd", "/c", cfg.PrintCommand)
+			cmd = exec.Command("powershell", "-NoProfile", "-Command", cfg.PrintCommand)
 		} else {
 			cmd = exec.Command("sh", "-c", cfg.PrintCommand)
 		}
