@@ -503,7 +503,7 @@ func renderTicket(job PoolJob) TicketDoc {
 	}
 	b.WriteString("========================================\n")
 	html := renderTicketHTML(nombreComercial, direccion, telefono, pedidoID, mesa, solicitadoPor, total, items, mensaje, leyenda)
-	escpos := renderTicketESCPOS(nombreComercial, direccion, telefono, pedidoID, mesa, solicitadoPor, total, items, mensaje, leyenda)
+	escpos := renderTicketESCPOS(nombreComercial, direccion, telefono, pedidoID, mesa, solicitadoPor, total, items, mensaje, leyenda, pedidoID)
 	return TicketDoc{HTML: html, Text: b.String(), ESCPos: escpos}
 }
 
@@ -610,7 +610,7 @@ func renderTicketHTML(nombreComercial, direccion, telefono, pedidoID, mesa, soli
 
 const escposLineWidth = 48 // 80mm paper, Font A
 
-func renderTicketESCPOS(nombreComercial, direccion, telefono, pedidoID, mesa, solicitadoPor string, total float64, items []TicketItem, mensaje, leyenda string) []byte {
+func renderTicketESCPOS(nombreComercial, direccion, telefono, pedidoID, mesa, solicitadoPor string, total float64, items []TicketItem, mensaje, leyenda, qrData string) []byte {
 	var b bytes.Buffer
 
 	// ESC/POS command helpers
@@ -737,6 +737,29 @@ func renderTicketESCPOS(nombreComercial, direccion, telefono, pedidoID, mesa, so
 	b.Write([]byte("GRACIAS POR SU PREFERENCIA!"))
 	b.Write(lf)
 	b.Write(lf)
+
+	// ── QR Code (ESC/POS GS ( k) ──
+	if strings.TrimSpace(qrData) != "" {
+		b.Write(center)
+		// Select model 2
+		b.Write([]byte{0x1d, 0x28, 0x6b, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00})
+		// Set module size (8 = ~large)
+		b.Write([]byte{0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, 0x08})
+		// Error correction level M (49)
+		b.Write([]byte{0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x45, 0x31})
+		// Store data: pL+pH*256 = len(qrData)+3
+		dataLen := len(qrData) + 3
+		pL := byte(dataLen & 0xFF)
+		pH := byte((dataLen >> 8) & 0xFF)
+		b.Write([]byte{0x1d, 0x28, 0x6b, pL, pH, 0x31, 0x50, 0x30})
+		b.Write([]byte(qrData))
+		// Print stored QR
+		b.Write([]byte{0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x51, 0x30})
+		b.Write(lf)
+		b.Write(lf)
+		b.Write(left)
+	}
+
 	b.Write(lf)
 	b.Write(lf)
 
