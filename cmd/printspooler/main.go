@@ -75,6 +75,7 @@ type TicketDoc struct {
 	HTML   string
 	Text   string
 	ESCPos []byte
+	ZPL    []byte
 }
 
 type APIClient struct {
@@ -406,6 +407,8 @@ func printTicket(cfg Config, jobID int64, doc TicketDoc) error {
 		switch strings.ToLower(cfg.RenderMode) {
 		case "escpos":
 			cmd.Stdin = bytes.NewReader(doc.ESCPos)
+		case "zpl":
+			cmd.Stdin = bytes.NewReader(doc.ZPL)
 		case "text":
 			cmd.Stdin = strings.NewReader(doc.Text)
 		default:
@@ -423,6 +426,9 @@ func printTicket(cfg Config, jobID int64, doc TicketDoc) error {
 		case "escpos":
 			data = doc.ESCPos
 			ext = "bin"
+		case "zpl":
+			data = doc.ZPL
+			ext = "zpl"
 		case "text":
 			data = []byte(doc.Text)
 			ext = "txt"
@@ -510,7 +516,8 @@ func renderTicket(job PoolJob) TicketDoc {
 	b.WriteString("========================================\n")
 	html := renderTicketHTML(nombreComercial, direccion, telefono, pedidoID, mesa, solicitadoPor, total, items, mensaje, leyenda)
 	escpos := renderTicketESCPOS(nombreComercial, direccion, telefono, pedidoID, mesa, solicitadoPor, total, items, mensaje, leyenda, pedidoID)
-	return TicketDoc{HTML: html, Text: b.String(), ESCPos: escpos}
+	zpl := renderTicketZPL(nombreComercial, direccion, telefono, pedidoID, mesa, solicitadoPor, total, items, mensaje, leyenda, pedidoID)
+	return TicketDoc{HTML: html, Text: b.String(), ESCPos: escpos, ZPL: zpl}
 }
 
 func parseTicketItems(raw any) []TicketItem {
@@ -773,6 +780,115 @@ func renderTicketESCPOS(nombreComercial, direccion, telefono, pedidoID, mesa, so
 	b.Write(cut)
 
 	return b.Bytes()
+}
+
+// ── ZPL renderer ───────────────────────────────────────────────────────
+
+func renderTicketZPL(nombreComercial, direccion, telefono, pedidoID, mesa, solicitadoPor string, total float64, items []TicketItem, mensaje, leyenda, qrData string) []byte {
+	var b strings.Builder
+	y := 20
+
+	line := func(label string, fontSize, fontW int) {
+		b.WriteString(fmt.Sprintf("^FO10,%d^A0N,%d,%d^FD%s^FS\n", y, fontSize, fontW, zplSafe(label)))
+		y += fontSize + 6
+	}
+	sep := func() {
+		b.WriteString(fmt.Sprintf("^FO10,%d^GB556,1,2^FS\n", y))
+		y += 8
+	}
+
+	b.WriteString("^XA\n")
+	b.WriteString("^CI28\n")  // UTF-8
+	b.WriteString("^PW576\n") // 80mm ≈ 576 dots
+
+	// ── Header ──
+	line(nombreComercial, 28, 16)
+	if strings.TrimSpace(direccion) != "" {
+		line(direccion, 18, 10)
+	}
+	if strings.TrimSpace(telefono) != "" {
+		line("Tel: "+telefono, 18, 10)
+	}
+	sep()
+
+	// ── Order info ──
+	line("TICKET DE VENTA", 22, 12)
+	line("Pedido: #"+pedidoID, 18, 10)
+	line("Mesa: "+mesa, 18, 10)
+	if strings.TrimSpace(solicitadoPor) != "" {
+		line("Solicito: "+solicitadoPor, 18, 10)
+	}
+	line("Fecha: "+time.Now().Format("2006-01-02 15:04:05"), 18, 10)
+	sep()
+
+	// ── Column headers ──
+	b.WriteString(fmt.Sprintf("^FO10,%d^A0N,18,10^FDDESCRIPCION^FS\n", y))
+	b.WriteString(fmt.Sprintf("^FO360,%d^A0N,18,10^FDCANT^FS\n", y))
+	b.WriteString(fmt.Sprintf("^FO450,%d^A0N,18,10^FDPRECIO^FS\n", y))
+	y += 24
+
+	// ── Items ──
+	for _, item := range items {
+		name := item.Nombre
+		if len(name) > 24 {
+			name = name[:24]
+		}
+		b.WriteString(fmt.Sprintf("^FO10,%d^A0N,18,10^FD%s^FS\n", y, zplSafe(name)))
+		b.WriteString(fmt.Sprintf("^FO360,%d^A0N,18,10^FD%d^FS\n", y, item.Cantidad))
+		b.WriteString(fmt.Sprintf("^FO450,%d^A0N,18,10^FD$%.2f^FS\n", y, item.Subtotal))
+		y += 22
+		for _, ex := range item.Extras {
+			exName := "+ " + ex.Nombre
+			if len(exName) > 26 {
+				exName = exName[:26]
+			}
+			b.WriteString(fmt.Sprintf("^FO20,%d^A0N,16,9^FD%s^FS\n", y, zplSafe(exName)))
+			b.WriteString(fmt.Sprintf("^FO450,%d^A0N,16,9^FD$%.2f^FS\n", y, ex.Precio))
+			y += 20
+		}
+		if strings.TrimSpace(item.Observacion) != "" {
+			b.WriteString(fmt.Sprintf("^FO20,%d^A0N,16,9^FDObs: %s^FS\n", y, zplSafe(item.Observacion)))
+			y += 20
+		}
+	}
+	if len(items) == 0 {
+		line("(sin detalles)", 18, 10)
+	}
+	sep()
+
+	// ── Total ──
+	b.WriteString(fmt.Sprintf("^FO10,%d^A0N,28,16^FDTOTAL: $%.2f^FS\n", y, total))
+	y += 36
+
+	// ── Footer messages ──
+	if strings.TrimSpace(mensaje) != "" {
+		line(mensaje, 18, 10)
+	}
+	if strings.TrimSpace(leyenda) != "" {
+		line(leyenda, 16, 9)
+	}
+	line("GRACIAS POR SU PREFERENCIA!", 18, 10)
+	y += 6
+
+	// ── QR Code ──
+	if strings.TrimSpace(qrData) != "" {
+		b.WriteString(fmt.Sprintf("^FO180,%d^BQN,2,5^FDLA,%s^FS\n", y, zplSafe(qrData)))
+		y += 130
+	}
+
+	// Set label length based on content
+	labelLen := y + 20
+	header := fmt.Sprintf("^XA\n^CI28\n^PW576\n^LL%d\n", labelLen)
+	full := strings.Replace(b.String(), "^XA\n^CI28\n^PW576\n", header, 1)
+	full += "^XZ\n"
+
+	return []byte(full)
+}
+
+func zplSafe(s string) string {
+	s = strings.ReplaceAll(s, "^", "")
+	s = strings.ReplaceAll(s, "~", "")
+	return s
 }
 
 // escposColumns formats a 3-column row: name (flexible) | qty (6 chars) | price (10 chars)
