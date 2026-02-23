@@ -788,18 +788,19 @@ func renderTicketZPL(nombreComercial, direccion, telefono, pedidoID, mesa, solic
 	var b strings.Builder
 	y := 20
 
+	w := func(s string) { b.WriteString(s) }
 	line := func(label string, fontSize, fontW int) {
-		b.WriteString(fmt.Sprintf("^FO10,%d^A0N,%d,%d^FD%s^FS\n", y, fontSize, fontW, zplSafe(label)))
+		w(fmt.Sprintf("^FO10,%d^A0N,%d,%d^FD%s^FS", y, fontSize, fontW, zplSafe(label)))
 		y += fontSize + 6
 	}
 	sep := func() {
-		b.WriteString(fmt.Sprintf("^FO10,%d^GB556,1,2^FS\n", y))
+		w(fmt.Sprintf("^FO10,%d^GB556,1,2^FS", y))
 		y += 8
 	}
 
-	b.WriteString("^XA\n")
-	b.WriteString("^CI28\n")  // UTF-8
-	b.WriteString("^PW576\n") // 80mm ≈ 576 dots
+	// Header placeholder — label length set at the end
+	// ^PW640 = 80mm at 203 DPI (RIBETEC standard)
+	w("^XA^PW640")
 
 	// ── Header ──
 	line(nombreComercial, 28, 16)
@@ -822,9 +823,9 @@ func renderTicketZPL(nombreComercial, direccion, telefono, pedidoID, mesa, solic
 	sep()
 
 	// ── Column headers ──
-	b.WriteString(fmt.Sprintf("^FO10,%d^A0N,18,10^FDDESCRIPCION^FS\n", y))
-	b.WriteString(fmt.Sprintf("^FO360,%d^A0N,18,10^FDCANT^FS\n", y))
-	b.WriteString(fmt.Sprintf("^FO450,%d^A0N,18,10^FDPRECIO^FS\n", y))
+	w(fmt.Sprintf("^FO10,%d^A0N,18,10^FDDESCRIPCION^FS", y))
+	w(fmt.Sprintf("^FO400,%d^A0N,18,10^FDCANT^FS", y))
+	w(fmt.Sprintf("^FO500,%d^A0N,18,10^FDPRECIO^FS", y))
 	y += 24
 
 	// ── Items ──
@@ -833,21 +834,21 @@ func renderTicketZPL(nombreComercial, direccion, telefono, pedidoID, mesa, solic
 		if len(name) > 24 {
 			name = name[:24]
 		}
-		b.WriteString(fmt.Sprintf("^FO10,%d^A0N,18,10^FD%s^FS\n", y, zplSafe(name)))
-		b.WriteString(fmt.Sprintf("^FO360,%d^A0N,18,10^FD%d^FS\n", y, item.Cantidad))
-		b.WriteString(fmt.Sprintf("^FO450,%d^A0N,18,10^FD$%.2f^FS\n", y, item.Subtotal))
+		w(fmt.Sprintf("^FO10,%d^A0N,18,10^FD%s^FS", y, zplSafe(name)))
+		w(fmt.Sprintf("^FO400,%d^A0N,18,10^FD%d^FS", y, item.Cantidad))
+		w(fmt.Sprintf("^FO500,%d^A0N,18,10^FD$%.2f^FS", y, item.Subtotal))
 		y += 22
 		for _, ex := range item.Extras {
 			exName := "+ " + ex.Nombre
 			if len(exName) > 26 {
 				exName = exName[:26]
 			}
-			b.WriteString(fmt.Sprintf("^FO20,%d^A0N,16,9^FD%s^FS\n", y, zplSafe(exName)))
-			b.WriteString(fmt.Sprintf("^FO450,%d^A0N,16,9^FD$%.2f^FS\n", y, ex.Precio))
+			w(fmt.Sprintf("^FO20,%d^A0N,16,9^FD%s^FS", y, zplSafe(exName)))
+			w(fmt.Sprintf("^FO500,%d^A0N,16,9^FD$%.2f^FS", y, ex.Precio))
 			y += 20
 		}
 		if strings.TrimSpace(item.Observacion) != "" {
-			b.WriteString(fmt.Sprintf("^FO20,%d^A0N,16,9^FDObs: %s^FS\n", y, zplSafe(item.Observacion)))
+			w(fmt.Sprintf("^FO20,%d^A0N,16,9^FDObs: %s^FS", y, zplSafe(item.Observacion)))
 			y += 20
 		}
 	}
@@ -857,10 +858,10 @@ func renderTicketZPL(nombreComercial, direccion, telefono, pedidoID, mesa, solic
 	sep()
 
 	// ── Total ──
-	b.WriteString(fmt.Sprintf("^FO10,%d^A0N,28,16^FDTOTAL: $%.2f^FS\n", y, total))
+	w(fmt.Sprintf("^FO10,%d^A0N,28,16^FDTOTAL: $%.2f^FS", y, total))
 	y += 36
 
-	// ── Footer messages ──
+	// ── Footer ──
 	if strings.TrimSpace(mensaje) != "" {
 		line(mensaje, 18, 10)
 	}
@@ -872,16 +873,15 @@ func renderTicketZPL(nombreComercial, direccion, telefono, pedidoID, mesa, solic
 
 	// ── QR Code ──
 	if strings.TrimSpace(qrData) != "" {
-		b.WriteString(fmt.Sprintf("^FO180,%d^BQN,2,5^FDLA,%s^FS\n", y, zplSafe(qrData)))
+		w(fmt.Sprintf("^FO180,%d^BQN,2,5^FDLA,%s^FS", y, zplSafe(qrData)))
 		y += 130
 	}
 
-	// Set label length based on content
-	labelLen := y + 20
-	header := fmt.Sprintf("^XA\n^CI28\n^PW576\n^LL%d\n", labelLen)
-	full := strings.Replace(b.String(), "^XA\n^CI28\n^PW576\n", header, 1)
-	full += "^XZ\n"
+	w("^XZ")
 
+	// Inject ^LL (label length) after ^PW576
+	labelLen := y + 20
+	full := strings.Replace(b.String(), "^XA^PW640", fmt.Sprintf("^XA^PW640^LL%d^MNY", labelLen), 1)
 	return []byte(full)
 }
 
