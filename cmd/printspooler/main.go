@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
 	"io"
 	"log"
 	"net/http"
@@ -19,12 +21,18 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	_ "image/jpeg"
+	_ "image/png"
+
+	qrcode "github.com/skip2/go-qrcode"
 )
 
 type Config struct {
 	BackendURL       string
 	LoginUser        string
 	LoginPassword    string
+	ImpresoraID      int
 	PollInterval     time.Duration
 	FetchLimit       int
 	PrintBackend     string
@@ -34,10 +42,13 @@ type Config struct {
 	LogJSONPayload   bool
 	RequestTimeout   time.Duration
 	RenderMode       string
+	LogoImagePath    string
 }
 
 type LoginResponse struct {
 	AccessToken string `json:"accessToken"`
+	Access      string `json:"access"`
+	Token       string `json:"token"`
 }
 
 type PendingResponse struct {
@@ -47,6 +58,8 @@ type PendingResponse struct {
 
 type PoolJob struct {
 	ID            int64           `json:"id"`
+	FolioPaquete  *string         `json:"folio_paquete"`
+	ImpresoraID   *int64          `json:"impresora_id"`
 	PedidoID      *int64          `json:"pedidoId"`
 	Mesa          *string         `json:"mesa"`
 	Origen        string          `json:"origen"`
@@ -151,7 +164,7 @@ func cycle(ctx context.Context, client *APIClient) error {
 			return ctx.Err()
 		}
 
-		doc := renderTicket(job)
+		doc := renderEtiquetaJob(client.cfg, job)
 		if client.cfg.LogJSONPayload {
 			log.Printf("job=%d payload=%s", job.ID, string(job.Payload))
 		}
@@ -180,12 +193,14 @@ func loadConfig() (Config, error) {
 		BackendURL:     normalizeBackendURL(strings.TrimSpace(os.Getenv("BACKEND_URL"))),
 		LoginUser:      strings.TrimSpace(os.Getenv("PRINT_USER")),
 		LoginPassword:  strings.TrimSpace(os.Getenv("PRINT_PASSWORD")),
+		ImpresoraID:    parseIntOrDefault(os.Getenv("IMPRESORA_ID"), 0),
 		PrintBackend:   defaultString(strings.TrimSpace(os.Getenv("PRINT_BACKEND")), "file"),
 		PrinterName:    strings.TrimSpace(os.Getenv("PRINTER_NAME")),
 		PrintCommand:   strings.TrimSpace(os.Getenv("PRINT_COMMAND")),
 		OutputDir:      defaultString(strings.TrimSpace(os.Getenv("OUTPUT_DIR")), "./outbox"),
 		LogJSONPayload: strings.EqualFold(strings.TrimSpace(os.Getenv("LOG_JSON_PAYLOAD")), "true"),
-		RenderMode:     defaultString(strings.TrimSpace(os.Getenv("RENDER_MODE")), "frontend_html"),
+		RenderMode:     defaultString(strings.TrimSpace(os.Getenv("RENDER_MODE")), "zpl"),
+		LogoImagePath:  defaultString(strings.TrimSpace(os.Getenv("LOGO_IMAGE_PATH")), "./cmd/printspooler/logo.png"),
 	}
 
 	if cfg.BackendURL == "" {
@@ -193,6 +208,9 @@ func loadConfig() (Config, error) {
 	}
 	if cfg.LoginUser == "" || cfg.LoginPassword == "" {
 		return cfg, errors.New("PRINT_USER y PRINT_PASSWORD son requeridos")
+	}
+	if cfg.ImpresoraID <= 0 {
+		return cfg, errors.New("IMPRESORA_ID es requerido y debe ser mayor a 0")
 	}
 
 	pollSeconds := parseIntOrDefault(os.Getenv("POLL_INTERVAL_SECONDS"), 4)
@@ -248,7 +266,7 @@ func (c *APIClient) ensureToken(ctx context.Context) error {
 
 func (c *APIClient) login(ctx context.Context) error {
 	payload := map[string]string{
-		"email":    c.cfg.LoginUser,
+		"username":    c.cfg.LoginUser,
 		"password": c.cfg.LoginPassword,
 	}
 
@@ -257,7 +275,7 @@ func (c *APIClient) login(ctx context.Context) error {
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.cfg.BackendURL, "/")+"/api/login", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.cfg.BackendURL, "/")+"/api/login/", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -278,18 +296,26 @@ func (c *APIClient) login(ctx context.Context) error {
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 		return err
 	}
-	if strings.TrimSpace(parsed.AccessToken) == "" {
+	token := strings.TrimSpace(parsed.AccessToken)
+	if token == "" {
+		token = strings.TrimSpace(parsed.Access)
+	}
+	if token == "" {
+		token = strings.TrimSpace(parsed.Token)
+	}
+	if token == "" {
 		return errors.New("login sin accessToken")
 	}
 
-	c.token = parsed.AccessToken
+	c.token = token
 	return nil
 }
 
 func (c *APIClient) fetchPending(ctx context.Context) ([]PoolJob, error) {
 	v := url.Values{}
 	v.Set("limit", strconv.Itoa(c.cfg.FetchLimit))
-	endpoint := strings.TrimRight(c.cfg.BackendURL, "/") + "/api/impresoras-termicas/micro/pool/pending?" + v.Encode()
+	v.Set("impresora_id", strconv.Itoa(c.cfg.ImpresoraID))
+	endpoint := strings.TrimRight(c.cfg.BackendURL, "/") + "/api/etiquetas-impresion/pool/pending/?" + v.Encode()
 
 	resp, err := c.doAuthRequest(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -311,12 +337,12 @@ func (c *APIClient) fetchPending(ctx context.Context) ([]PoolJob, error) {
 }
 
 func (c *APIClient) markPrinted(ctx context.Context, id int64) error {
-	endpoint := fmt.Sprintf("%s/api/impresoras-termicas/micro/pool/%d/printed", strings.TrimRight(c.cfg.BackendURL, "/"), id)
+	endpoint := fmt.Sprintf("%s/api/etiquetas-impresion/pool/%d/printed/", strings.TrimRight(c.cfg.BackendURL, "/"), id)
 	return c.simplePost(ctx, endpoint)
 }
 
 func (c *APIClient) markError(ctx context.Context, id int64) error {
-	endpoint := fmt.Sprintf("%s/api/impresoras-termicas/micro/pool/%d/error", strings.TrimRight(c.cfg.BackendURL, "/"), id)
+	endpoint := fmt.Sprintf("%s/api/etiquetas-impresion/pool/%d/error/", strings.TrimRight(c.cfg.BackendURL, "/"), id)
 	return c.simplePost(ctx, endpoint)
 }
 
@@ -442,6 +468,265 @@ func printTicket(cfg Config, jobID int64, doc TicketDoc) error {
 		}
 		return nil
 	}
+}
+
+func renderEtiquetaJob(cfg Config, job PoolJob) TicketDoc {
+	var payload map[string]any
+	_ = json.Unmarshal(job.Payload, &payload)
+
+	folio := strings.TrimSpace(stringFromAny(payload["folio_paquete"]))
+	if folio == "" && job.FolioPaquete != nil {
+		folio = strings.TrimSpace(*job.FolioPaquete)
+	}
+	if folio == "" {
+		folio = fmt.Sprintf("JOB-%d", job.ID)
+	}
+
+	var b strings.Builder
+	b.WriteString("========================================\n")
+	b.WriteString("       ETIQUETA DE ENVIO (ZPL)          \n")
+	b.WriteString("========================================\n")
+	b.WriteString(fmt.Sprintf("Trabajo: #%d\n", job.ID))
+	b.WriteString(fmt.Sprintf("Folio:   %s\n", folio))
+	b.WriteString(fmt.Sprintf("Ruta:    %s\n", stringFromAny(payload["ruta_paquete"])))
+	b.WriteString("========================================\n")
+
+	return TicketDoc{
+		Text: b.String(),
+		ZPL:  renderEtiquetaEnvioZPL(cfg, payload),
+	}
+}
+
+func renderEtiquetaEnvioZPL(cfg Config, payload map[string]any) []byte {
+	folio := stringOrDefault(stringFromAny(payload["folio_paquete"]), " -- ")
+	cliente := stringOrDefault(stringFromAny(payload["cliente_nombre"]), " -- ")
+	estado := stringOrDefault(stringFromAny(payload["estado_nombre"]), " -- ")
+	municipio := stringOrDefault(stringFromAny(payload["municipio_nombre"]), " -- ")
+	ruta := stringOrDefault(stringFromAny(payload["ruta_paquete"]), " Ruta por definir ")
+	tipoProducto := stringOrDefault(stringFromAny(payload["tipo_producto_text"]), " -- ")
+	peso := strings.TrimSpace(stringFromAny(payload["peso"]))
+	alto := strings.TrimSpace(stringFromAny(payload["alto"]))
+	largo := strings.TrimSpace(stringFromAny(payload["largo"]))
+	ancho := strings.TrimSpace(stringFromAny(payload["ancho"]))
+	esDomicilio := boolFromAny(payload["es_domicilio"])
+	esPieza := boolFromAny(payload["es_pieza"])
+	sobrepeso := boolFromAny(payload["sobrepeso"])
+
+	destino := strings.TrimSpace(stringFromAny(payload["domicilio_completo"]))
+	if !esDomicilio {
+		destino = strings.TrimSpace(stringFromAny(payload["sucursal_nombre"]))
+	}
+	if destino == "" {
+		destino = " -- "
+	}
+
+	var b strings.Builder
+	// 4x6 thermal label @203dpi => ~812 x 1218 dots
+	labelWidth := 812
+	labelHeight := 1218
+	y := 20
+	w := func(s string) { b.WriteString(s) }
+	centerLine := func(text string, fontH, fontW int) {
+		w(fmt.Sprintf("^FO0,%d^A0N,%d,%d^FB%d,1,0,C,0^FD%s^FS", y, fontH, fontW, labelWidth, zplSafe(text)))
+		y += fontH + 8
+	}
+	leftLine := func(text string, fontH, fontW int) {
+		w(fmt.Sprintf("^FO90,%d^A0N,%d,%d^FD%s^FS", y, fontH, fontW, zplSafe(text)))
+		y += fontH + 8
+	}
+
+	w("^XA^PW812")
+	logoWidth := 420
+	logoHeight := 120
+	logoX := (labelWidth - logoWidth) / 2
+	logoY := 20
+	logoCmd := buildLogoGFACommand(cfg.LogoImagePath, logoX, logoY, logoWidth, logoHeight)
+	if logoCmd != "" {
+		w(logoCmd)
+	} else {
+		y = 55
+		centerLine("PUEBLA EXPRESS", 48, 26)
+	}
+
+	y = logoY + logoHeight + 48
+	centerLine(folio, 72, 38)
+	y += 14
+	// QR como ^GFA para controlar tamaño (igual que etiqueta original: ~105/220 del ancho → ~387 dots; usamos 380)
+	qrSize := 380
+	qrX := (labelWidth - qrSize) / 2
+	qrGFA := buildQRGFA(folio, qrX, y, qrSize)
+	if qrGFA != "" {
+		w(qrGFA)
+	} else {
+		w(fmt.Sprintf("^FO%d,%d^BQN,2,10^FDLA,%s^FS", qrX, y, zplSafe(folio)))
+	}
+	y += qrSize
+	centerLine(tipoProducto, 68, 36)
+	if !esPieza && peso != "" {
+		centerLine(peso, 68, 36)
+	}
+	if alto != "" || largo != "" || ancho != "" {
+		centerLine(fmt.Sprintf(`%s" x %s" x %s"`, alto, largo, ancho), 34, 18)
+	}
+	y += 8
+	leftLine("Cliente: "+cliente, 50, 26)
+	if esDomicilio {
+		leftLine("Domicilio: "+destino, 46, 24)
+	} else {
+		leftLine("Sucursal: "+destino, 46, 24)
+	}
+	leftLine("Estado: "+estado, 46, 24)
+	leftLine("Municipio: "+municipio, 46, 24)
+	leftLine("Bodega descarga: PUE", 46, 24)
+	leftLine("Ruta: "+ruta, 58, 30)
+	if sobrepeso {
+		leftLine("Sobrepeso", 58, 30)
+	}
+
+	labelLen := y + 40
+	if labelLen > labelHeight {
+		labelLen = labelHeight
+	}
+	w("^XZ")
+	return []byte(strings.Replace(b.String(), "^XA^PW812", fmt.Sprintf("^XA^PW812^LL%d^MNY", labelLen), 1))
+}
+
+func buildLogoGFACommand(path string, x, y, targetW, targetH int) string {
+	p := resolveLogoPath(strings.TrimSpace(path))
+	if p == "" {
+		return ""
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	img, _, err := image.Decode(f)
+	if err != nil {
+		return ""
+	}
+
+	srcB := img.Bounds()
+	srcW := srcB.Dx()
+	srcH := srcB.Dy()
+	if srcW <= 0 || srcH <= 0 || targetW <= 0 || targetH <= 0 {
+		return ""
+	}
+
+	bytesPerRow := (targetW + 7) / 8
+	data := make([]byte, bytesPerRow*targetH)
+	for yy := 0; yy < targetH; yy++ {
+		sy := srcB.Min.Y + (yy*srcH)/targetH
+		for xx := 0; xx < targetW; xx++ {
+			sx := srcB.Min.X + (xx*srcW)/targetW
+			r, g, bb, a := img.At(sx, sy).RGBA()
+			alpha := uint8(a >> 8)
+			if alpha < 120 {
+				continue
+			}
+			r8 := float64(uint8(r >> 8))
+			g8 := float64(uint8(g >> 8))
+			b8 := float64(uint8(bb >> 8))
+			luma := 0.299*r8 + 0.587*g8 + 0.114*b8
+			if luma < 160 {
+				idx := yy*bytesPerRow + (xx / 8)
+				data[idx] |= 1 << uint(7-(xx%8))
+			}
+		}
+	}
+
+	total := len(data)
+	hexData := strings.ToUpper(hex.EncodeToString(data))
+	return fmt.Sprintf("^FO%d,%d^GFA,%d,%d,%d,%s^FS", x, y, total, total, bytesPerRow, hexData)
+}
+
+// buildQRGFA genera un QR del contenido como gráfico ^GFA para fijar tamaño (p. ej. igual que etiqueta original).
+func buildQRGFA(content string, x, y, size int) string {
+	if size <= 0 || content == "" {
+		return ""
+	}
+	pngBytes, err := qrcode.Encode(content, qrcode.Medium, size)
+	if err != nil {
+		return ""
+	}
+	img, _, err := image.Decode(bytes.NewReader(pngBytes))
+	if err != nil {
+		return ""
+	}
+	bounds := img.Bounds()
+	srcW := bounds.Dx()
+	srcH := bounds.Dy()
+	if srcW <= 0 || srcH <= 0 {
+		return ""
+	}
+	bytesPerRow := (size + 7) / 8
+	data := make([]byte, bytesPerRow*size)
+	for yy := 0; yy < size; yy++ {
+		sy := bounds.Min.Y + (yy*srcH)/size
+		for xx := 0; xx < size; xx++ {
+			sx := bounds.Min.X + (xx*srcW)/size
+			r, g, bb, a := img.At(sx, sy).RGBA()
+			if a>>8 < 120 {
+				continue
+			}
+			r8 := float64(uint8(r >> 8))
+			g8 := float64(uint8(g >> 8))
+			b8 := float64(uint8(bb >> 8))
+			luma := 0.299*r8 + 0.587*g8 + 0.114*b8
+			if luma < 160 {
+				idx := yy*bytesPerRow + (xx / 8)
+				data[idx] |= 1 << uint(7-(xx%8))
+			}
+		}
+	}
+	total := len(data)
+	hexData := strings.ToUpper(hex.EncodeToString(data))
+	return fmt.Sprintf("^FO%d,%d^GFA,%d,%d,%d,%s^FS", x, y, total, total, bytesPerRow, hexData)
+}
+
+func resolveLogoPath(raw string) string {
+	candidates := []string{}
+	if strings.TrimSpace(raw) != "" {
+		candidates = append(candidates, raw)
+	}
+	candidates = append(candidates,
+		"./cmd/printspooler/logo.png",
+		"./cmd/printspooler/logo.jpg",
+		"./cmd/printspooler/images/logo.png",
+		"./assets/logo.png",
+		"./images/logo.png",
+		"./logo.png",
+	)
+
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(exeDir, "logo.png"),
+			filepath.Join(exeDir, "images", "logo.png"),
+		)
+	}
+
+	seen := map[string]bool{}
+	for _, c := range candidates {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		if !filepath.IsAbs(c) {
+			if abs, err := filepath.Abs(c); err == nil {
+				c = abs
+			}
+		}
+		if seen[c] {
+			continue
+		}
+		seen[c] = true
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+	return ""
 }
 
 func renderTicket(job PoolJob) TicketDoc {
@@ -1032,5 +1317,23 @@ func numberFromAny(v any) float64 {
 		return f
 	default:
 		return 0
+	}
+}
+
+func boolFromAny(v any) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case float64:
+		return x != 0
+	case int:
+		return x != 0
+	case int64:
+		return x != 0
+	case string:
+		s := strings.TrimSpace(strings.ToLower(x))
+		return s == "1" || s == "true" || s == "yes" || s == "si"
+	default:
+		return false
 	}
 }
