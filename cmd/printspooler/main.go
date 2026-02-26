@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
+	"image/draw"
 	"io"
 	"log"
 	"net/http"
@@ -24,6 +26,11 @@ import (
 
 	_ "image/jpeg"
 	_ "image/png"
+
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/gofont/gobold"
+	"golang.org/x/image/font/opentype"
+	"golang.org/x/image/math/fixed"
 
 	qrcode "github.com/skip2/go-qrcode"
 )
@@ -70,25 +77,9 @@ type PoolJob struct {
 	Payload       json.RawMessage `json:"payload"`
 }
 
-type TicketExtra struct {
-	Nombre   string
-	Cantidad int
-	Precio   float64
-}
-
-type TicketItem struct {
-	Nombre      string
-	Cantidad    int
-	Subtotal    float64
-	Observacion string
-	Extras      []TicketExtra
-}
-
 type TicketDoc struct {
-	HTML   string
-	Text   string
-	ESCPos []byte
-	ZPL    []byte
+	Text string
+	ZPL  []byte
 }
 
 type APIClient struct {
@@ -409,6 +400,7 @@ func (c *APIClient) doAuthRequest(ctx context.Context, method, endpoint string, 
 }
 
 func printTicket(cfg Config, jobID int64, doc TicketDoc) error {
+	// Solo etiquetas de envío: ZPL o texto
 	switch strings.ToLower(cfg.PrintBackend) {
 	case "lp":
 		args := []string{}
@@ -417,7 +409,11 @@ func printTicket(cfg Config, jobID int64, doc TicketDoc) error {
 		}
 		args = append(args, "-")
 		cmd := exec.Command("lp", args...)
-		cmd.Stdin = strings.NewReader(doc.Text)
+		if strings.ToLower(cfg.RenderMode) == "zpl" && len(doc.ZPL) > 0 {
+			cmd.Stdin = bytes.NewReader(doc.ZPL)
+		} else {
+			cmd.Stdin = strings.NewReader(doc.Text)
+		}
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("lp error: %w output=%s", err, string(out))
@@ -430,15 +426,10 @@ func printTicket(cfg Config, jobID int64, doc TicketDoc) error {
 		} else {
 			cmd = exec.Command("sh", "-c", cfg.PrintCommand)
 		}
-		switch strings.ToLower(cfg.RenderMode) {
-		case "escpos":
-			cmd.Stdin = bytes.NewReader(doc.ESCPos)
-		case "zpl":
+		if strings.ToLower(cfg.RenderMode) == "zpl" && len(doc.ZPL) > 0 {
 			cmd.Stdin = bytes.NewReader(doc.ZPL)
-		case "text":
+		} else {
 			cmd.Stdin = strings.NewReader(doc.Text)
-		default:
-			cmd.Stdin = strings.NewReader(doc.HTML)
 		}
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -446,21 +437,11 @@ func printTicket(cfg Config, jobID int64, doc TicketDoc) error {
 		}
 		return nil
 	default:
-		var data []byte
-		var ext string
-		switch strings.ToLower(cfg.RenderMode) {
-		case "escpos":
-			data = doc.ESCPos
-			ext = "bin"
-		case "zpl":
-			data = doc.ZPL
-			ext = "zpl"
-		case "text":
-			data = []byte(doc.Text)
+		ext := "zpl"
+		data := doc.ZPL
+		if strings.ToLower(cfg.RenderMode) == "text" || len(data) == 0 {
 			ext = "txt"
-		default:
-			data = []byte(doc.HTML)
-			ext = "html"
+			data = []byte(doc.Text)
 		}
 		fileName := filepath.Join(cfg.OutputDir, fmt.Sprintf("job_%d_%d.%s", jobID, time.Now().UnixNano(), ext))
 		if err := os.WriteFile(fileName, data, 0o644); err != nil {
@@ -521,23 +502,35 @@ func renderEtiquetaEnvioZPL(cfg Config, payload map[string]any) []byte {
 	}
 
 	var b strings.Builder
-	// 4x6 thermal label @203dpi => ~812 x 1218 dots
+	// 4x6 thermal label @203dpi => ~812 x 1218 dots; contenido bien ensanchado en X
 	labelWidth := 812
 	labelHeight := 1218
+	leftMargin := 15 // margen mínimo para ensanchar al máximo el contenido
 	y := 20
 	w := func(s string) { b.WriteString(s) }
 	centerLine := func(text string, fontH, fontW int) {
 		w(fmt.Sprintf("^FO0,%d^A0N,%d,%d^FB%d,1,0,C,0^FD%s^FS", y, fontH, fontW, labelWidth, zplSafe(text)))
 		y += fontH + 8
 	}
+	// Menos espacio entre líneas (para bloque tipo producto / peso / medidas)
+	centerLineCompact := func(text string, fontH, fontW int) {
+		w(fmt.Sprintf("^FO0,%d^A0N,%d,%d^FB%d,1,0,C,0^FD%s^FS", y, fontH, fontW, labelWidth, zplSafe(text)))
+		y += fontH + 4
+	}
 	leftLine := func(text string, fontH, fontW int) {
-		w(fmt.Sprintf("^FO90,%d^A0N,%d,%d^FD%s^FS", y, fontH, fontW, zplSafe(text)))
+		w(fmt.Sprintf("^FO%d,%d^A0N,%d,%d^FD%s^FS", leftMargin, y, fontH, fontW, zplSafe(text)))
+		y += fontH + 8
+	}
+	// Negrita mismo tamaño que leftLine: dos pasadas con 1 dot de desplazamiento
+	leftLineBold := func(text string, fontH, fontW int) {
+		w(fmt.Sprintf("^FO%d,%d^A0N,%d,%d^FD%s^FS", leftMargin, y, fontH, fontW, zplSafe(text)))
+		w(fmt.Sprintf("^FO%d,%d^A0N,%d,%d^FD%s^FS", leftMargin+1, y, fontH, fontW, zplSafe(text)))
 		y += fontH + 8
 	}
 
-	w("^XA^PW812")
+	w("^XA^CI28^PW812") // ^CI28 = UTF-8 para que salgan bien acentos (é, á, ñ, etc.)
 	logoWidth := 420
-	logoHeight := 120
+	logoHeight := 200 // alargado en Y (antes 120)
 	logoX := (labelWidth - logoWidth) / 2
 	logoY := 20
 	logoCmd := buildLogoGFACommand(cfg.LogoImagePath, logoX, logoY, logoWidth, logoHeight)
@@ -548,39 +541,51 @@ func renderEtiquetaEnvioZPL(cfg Config, payload map[string]any) []byte {
 		centerLine("PUEBLA EXPRESS", 48, 26)
 	}
 
-	y = logoY + logoHeight + 48
-	centerLine(folio, 72, 38)
-	y += 14
-	// QR como ^GFA para controlar tamaño (igual que etiqueta original: ~105/220 del ancho → ~387 dots; usamos 380)
+	// Logo → folio → QR (subido en Y); luego gap → tipo producto → peso → medidas → Cliente
+	y = logoY + logoHeight + 0 // sin hueco para subir folio y QR
+	centerLine(folio, 72, 50)
+	y += 0 // QR pegado al folio para subirlo más
+	qrY := y
 	qrSize := 380
 	qrX := (labelWidth - qrSize) / 2
-	qrGFA := buildQRGFA(folio, qrX, y, qrSize)
+	qrGFA := buildQRGFA(folio, qrX, qrY, qrSize)
 	if qrGFA != "" {
 		w(qrGFA)
 	} else {
-		w(fmt.Sprintf("^FO%d,%d^BQN,2,10^FDLA,%s^FS", qrX, y, zplSafe(folio)))
+		w(fmt.Sprintf("^FO%d,%d^BQN,2,10^FDLA,%s^FS", qrX, qrY, zplSafe(folio)))
 	}
-	y += qrSize
-	centerLine(tipoProducto, 68, 36)
-	if !esPieza && peso != "" {
-		centerLine(peso, 68, 36)
-	}
-	if alto != "" || largo != "" || ancho != "" {
-		centerLine(fmt.Sprintf(`%s" x %s" x %s"`, alto, largo, ancho), 34, 18)
-	}
-	y += 8
-	leftLine("Cliente: "+cliente, 50, 26)
-	if esDomicilio {
-		leftLine("Domicilio: "+destino, 46, 24)
+	// PDF: después del QR hace y += 120 (QR 105mm + 15mm gap). En 4x6" ~24 dots de gap.
+	y = qrY + qrSize + 24
+	// Tipo de producto debajo del QR; padding top generoso para que no se corten las letras por arriba
+	if cmd := buildBoldTextGFA(tipoProducto, 0, y, labelWidth, 50, true, 20); cmd != "" {
+		w(cmd)
+		y += 70 + 6 // 50+20 altura GFA + espacio
 	} else {
-		leftLine("Sucursal: "+destino, 46, 24)
+		w(fmt.Sprintf("^FO0,%d^A0N,48,30^FB%d,1,0,C,0^FD%s^FS", y, labelWidth, zplSafe(tipoProducto)))
+		y += 48 + 6
 	}
-	leftLine("Estado: "+estado, 46, 24)
-	leftLine("Municipio: "+municipio, 46, 24)
-	leftLine("Bodega descarga: PUE", 46, 24)
-	leftLine("Ruta: "+ruta, 58, 30)
+	// Peso (PDF: mismo tamaño que tipo, luego y += 10)
+	if !esPieza && peso != "" {
+		centerLineCompact(peso, 40, 22)
+	}
+	// Medidas (PDF: font 20, y += 10)
+	if alto != "" || largo != "" || ancho != "" {
+		centerLineCompact(fmt.Sprintf(`%s" x %s" x %s"`, alto, largo, ancho), 34, 24)
+	}
+	y += 16 // PDF: espacio antes del bloque Cliente (padding top)
+	leftLine("Cliente: "+cliente, 50, 32)
+	if esDomicilio {
+		leftLine("Domicilio: "+destino, 46, 28)
+	} else {
+		leftLine("Sucursal: "+destino, 46, 28)
+	}
+	leftLine("Estado: "+estado, 46, 28)
+	leftLine("Municipio: "+municipio, 46, 28)
+	leftLine("Bodega descarga: PUE", 46, 28)
+	// Ruta mismo tamaño que Cliente (50, 32) pero en negrita
+	leftLineBold("Ruta: "+ruta, 50, 32)
 	if sobrepeso {
-		leftLine("Sobrepeso", 58, 30)
+		leftLine("Sobrepeso", 58, 36)
 	}
 
 	labelLen := y + 40
@@ -588,7 +593,7 @@ func renderEtiquetaEnvioZPL(cfg Config, payload map[string]any) []byte {
 		labelLen = labelHeight
 	}
 	w("^XZ")
-	return []byte(strings.Replace(b.String(), "^XA^PW812", fmt.Sprintf("^XA^PW812^LL%d^MNY", labelLen), 1))
+	return []byte(strings.Replace(b.String(), "^XA^CI28^PW812", fmt.Sprintf("^XA^CI28^PW812^LL%d^MNY", labelLen), 1))
 }
 
 func buildLogoGFACommand(path string, x, y, targetW, targetH int) string {
@@ -685,6 +690,97 @@ func buildQRGFA(content string, x, y, size int) string {
 	return fmt.Sprintf("^FO%d,%d^GFA,%d,%d,%d,%s^FS", x, y, total, total, bytesPerRow, hexData)
 }
 
+// buildBoldTextGFA dibuja el texto con fuente bold (Go Bold TTF) y lo devuelve como ^GFA para ZPL.
+// Si el texto es más ancho que width, se reduce el tamaño de fuente para que quepa.
+// topPadding añade píxeles en blanco arriba del texto para que no se corten ascendentes (ej. en "Libras").
+func buildBoldTextGFA(text string, posX, posY, width, height int, center bool, topPadding int) string {
+	if text == "" || width <= 0 || height <= 0 {
+		return ""
+	}
+	if topPadding < 0 {
+		topPadding = 0
+	}
+	ttf, err := opentype.Parse(gobold.TTF)
+	if err != nil {
+		return ""
+	}
+	// Tamaño en puntos: limitado por altura para que no se corte
+	pt := float64(height) * 0.65
+	if pt < 6 {
+		pt = 6
+	}
+	// Reducir pt hasta que el texto quepa en width (para rutas largas, etc.)
+	for pt >= 6 {
+		tryFace, err := opentype.NewFace(ttf, &opentype.FaceOptions{Size: pt, DPI: 203})
+		if err != nil {
+			return ""
+		}
+		drMeasure := &font.Drawer{Face: tryFace}
+		adv := drMeasure.MeasureString(text)
+		tryFace.Close()
+		if adv.Round() <= width {
+			break
+		}
+		pt *= 0.85
+	}
+	if pt < 6 {
+		pt = 6
+	}
+	face, err := opentype.NewFace(ttf, &opentype.FaceOptions{Size: pt, DPI: 203})
+	if err != nil {
+		return ""
+	}
+	defer face.Close()
+
+	totalHeight := height + topPadding
+	img := image.NewRGBA(image.Rect(0, 0, width, totalHeight))
+	draw.Draw(img, img.Bounds(), &image.Uniform{color.White}, image.Point{}, draw.Src)
+
+	dr := &font.Drawer{
+		Dst:  img,
+		Src:  image.NewUniform(color.Black),
+		Face: face,
+	}
+	adv := dr.MeasureString(text)
+	advPx := adv.Round()
+	xPx := 0
+	if center && advPx < width {
+		xPx = (width - advPx) / 2
+	}
+	ascent := face.Metrics().Ascent.Round()
+	// Baseline un poco más abajo para dejar margen arriba (evita que se corten L, b, s en "Libras")
+	baselineY := topPadding + ascent + 8
+	if baselineY+4 > totalHeight {
+		baselineY = totalHeight - 4
+	}
+	dr.Dot = fixed.P(xPx, baselineY)
+	dr.DrawString(text)
+
+	// Convertir RGBA a 1-bit (negro = 1) y luego a GFA
+	bytesPerRow := (width + 7) / 8
+	data := make([]byte, bytesPerRow*totalHeight)
+	bounds := img.Bounds()
+	for yy := 0; yy < totalHeight; yy++ {
+		for xx := 0; xx < width; xx++ {
+			r, g, bb, a := img.At(bounds.Min.X+xx, bounds.Min.Y+yy).RGBA()
+			if a>>8 < 120 {
+				continue
+			}
+			r8 := float64(uint8(r >> 8))
+			g8 := float64(uint8(g >> 8))
+			b8 := float64(uint8(bb >> 8))
+			luma := 0.299*r8 + 0.587*g8 + 0.114*b8
+			if luma < 200 {
+				idx := yy*bytesPerRow + (xx / 8)
+				data[idx] |= 1 << uint(7-(xx%8))
+			}
+		}
+	}
+	total := len(data)
+	hexData := strings.ToUpper(hex.EncodeToString(data))
+	return fmt.Sprintf("^FO%d,%d^GFA,%d,%d,%d,%s^FS", posX, posY, total, total, bytesPerRow, hexData)
+}
+
 func resolveLogoPath(raw string) string {
 	candidates := []string{}
 	if strings.TrimSpace(raw) != "" {
@@ -729,477 +825,10 @@ func resolveLogoPath(raw string) string {
 	return ""
 }
 
-func renderTicket(job PoolJob) TicketDoc {
-	var payload map[string]any
-	_ = json.Unmarshal(job.Payload, &payload)
-
-	pedidoID := "-"
-	if job.PedidoID != nil {
-		pedidoID = strconv.FormatInt(*job.PedidoID, 10)
-	}
-
-	mesa := "-"
-	if job.Mesa != nil {
-		mesa = *job.Mesa
-	}
-
-	total := numberFromAny(payload["total"])
-	items := parseTicketItems(payload["detalles"])
-	nombreComercial := stringFromAny(payload["nombreComercial"])
-	if strings.TrimSpace(nombreComercial) == "" && job.EmpresaNombre != nil {
-		nombreComercial = *job.EmpresaNombre
-	}
-	nombreComercial = stringOrDefault(nombreComercial, "EMPRESA")
-	direccion := stringFromAny(payload["direccion"])
-	telefono := stringFromAny(payload["telefono"])
-	mensaje := stringFromAny(payload["mensaje"])
-	leyenda := stringFromAny(payload["leyendaFiscal"])
-	solicitadoPor := ""
-	if job.CreatedByName != nil {
-		solicitadoPor = strings.TrimSpace(*job.CreatedByName)
-	}
-	if solicitadoPor == "" {
-		solicitadoPor = strings.TrimSpace(stringFromAny(payload["atendio"]))
-	}
-	if solicitadoPor == "" {
-		solicitadoPor = strings.TrimSpace(stringFromAny(payload["usuarioNombre"]))
-	}
-
-	var b strings.Builder
-	b.WriteString("========================================\n")
-	b.WriteString("           TICKET DE IMPRESION          \n")
-	b.WriteString("========================================\n")
-	b.WriteString(fmt.Sprintf("Trabajo: #%d\n", job.ID))
-	b.WriteString(fmt.Sprintf("Pedido:  #%s\n", pedidoID))
-	b.WriteString(fmt.Sprintf("Mesa:    %s\n", mesa))
-	b.WriteString(fmt.Sprintf("Origen:  %s\n", job.Origen))
-	if solicitadoPor != "" {
-		b.WriteString(fmt.Sprintf("Solicito: %s\n", solicitadoPor))
-	}
-	b.WriteString(fmt.Sprintf("Fecha:   %s\n", time.Now().Format("2006-01-02 15:04:05")))
-	b.WriteString("----------------------------------------\n")
-	b.WriteString("Items\n")
-
-	if len(items) == 0 {
-		b.WriteString("(sin detalles en payload)\n")
-	}
-
-	for _, item := range items {
-		b.WriteString(fmt.Sprintf("- %dx %s ..... $%.2f\n", item.Cantidad, item.Nombre, item.Subtotal))
-		for _, ex := range item.Extras {
-			b.WriteString(fmt.Sprintf("  + %dx %s ..... $%.2f\n", ex.Cantidad, ex.Nombre, ex.Precio))
-		}
-		if strings.TrimSpace(item.Observacion) != "" {
-			b.WriteString(fmt.Sprintf("  Obs: %s\n", item.Observacion))
-		}
-	}
-
-	b.WriteString("----------------------------------------\n")
-	if total > 0 {
-		b.WriteString(fmt.Sprintf("TOTAL: $%.2f\n", total))
-	}
-	b.WriteString("========================================\n")
-	html := renderTicketHTML(nombreComercial, direccion, telefono, pedidoID, mesa, solicitadoPor, total, items, mensaje, leyenda)
-	escpos := renderTicketESCPOS(nombreComercial, direccion, telefono, pedidoID, mesa, solicitadoPor, total, items, mensaje, leyenda, pedidoID)
-	zpl := renderTicketZPL(nombreComercial, direccion, telefono, pedidoID, mesa, solicitadoPor, total, items, mensaje, leyenda, pedidoID)
-	return TicketDoc{HTML: html, Text: b.String(), ESCPos: escpos, ZPL: zpl}
-}
-
-func parseTicketItems(raw any) []TicketItem {
-	detalles, ok := raw.([]any)
-	if !ok {
-		return nil
-	}
-	items := make([]TicketItem, 0, len(detalles))
-	for _, rawItem := range detalles {
-		itemMap, ok := rawItem.(map[string]any)
-		if !ok {
-			continue
-		}
-		item := TicketItem{
-			Nombre:      stringOrDefault(stringFromAny(itemMap["nombre"]), "Platillo"),
-			Cantidad:    intOrDefault(intFromAny(itemMap["cantidad"]), 1),
-			Subtotal:    numberFromAny(itemMap["subtotal"]),
-			Observacion: stringFromAny(itemMap["observacion"]),
-		}
-
-		extrasRaw, _ := itemMap["extras"].([]any)
-		for _, rawExtra := range extrasRaw {
-			exMap, ok := rawExtra.(map[string]any)
-			if !ok {
-				continue
-			}
-			cant := intOrDefault(intFromAny(exMap["cantidad"]), 1)
-			sub := numberFromAny(exMap["subtotal"])
-			if sub <= 0 {
-				sub = numberFromAny(exMap["precioAdicional"]) * float64(cant)
-			}
-			if sub <= 0 {
-				continue
-			}
-			item.Extras = append(item.Extras, TicketExtra{
-				Nombre:   stringOrDefault(stringFromAny(exMap["nombre"]), "Extra"),
-				Cantidad: cant,
-				Precio:   sub,
-			})
-		}
-
-		items = append(items, item)
-	}
-	return items
-}
-
-func renderTicketHTML(nombreComercial, direccion, telefono, pedidoID, mesa, solicitadoPor string, total float64, items []TicketItem, mensaje, leyenda string) string {
-	var detalles strings.Builder
-	for _, item := range items {
-		detalles.WriteString(`<div class="item-row"><div class="item-name">` + escapeHTML(item.Nombre) + `</div><div class="item-qty">` + strconv.Itoa(item.Cantidad) + `</div><div class="item-price">$` + fmt.Sprintf("%.2f", item.Subtotal) + `</div></div>`)
-		if len(item.Extras) > 0 {
-			detalles.WriteString(`<div class="extras">`)
-			for _, ex := range item.Extras {
-				detalles.WriteString(`<div class="extra-row"><span>` + strconv.Itoa(ex.Cantidad) + ` x ` + escapeHTML(ex.Nombre) + `</span><span>$` + fmt.Sprintf("%.2f", ex.Precio) + `</span></div>`)
-			}
-			detalles.WriteString(`</div>`)
-		}
-		if strings.TrimSpace(item.Observacion) != "" {
-			detalles.WriteString(`<div class="small" style="margin-left: 10px;">Obs: ` + escapeHTML(item.Observacion) + `</div>`)
-		}
-	}
-
-	parts := []string{
-		`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">`,
-		`<title>Ticket #` + escapeHTML(pedidoID) + `</title>`,
-		`<style>@page{size:80mm auto;margin:0}*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Courier New',Courier,monospace;width:80mm;max-width:80mm;margin:0;padding:5mm;font-size:12px;line-height:1.4;background:white}.center{text-align:center}.bold{font-weight:bold}.separator{border-top:1px dashed #000;margin:8px 0}.item-row{display:flex;justify-content:space-between;margin:3px 0}.item-name{flex:1;word-wrap:break-word}.item-qty{width:30px;text-align:center}.item-price{width:60px;text-align:right}.extras{margin-left:6px;font-size:11px}.extra-row{display:flex;justify-content:space-between}.total-row{display:flex;justify-content:space-between;font-weight:bold;font-size:14px;margin-top:10px}.footer{margin-top:15px;font-size:10px;text-align:center}.small{font-size:10px}</style></head><body class="ticket-print"><div class="ticket-content">`,
-		`<div class="center bold">` + escapeHTML(nombreComercial) + `</div>`,
-	}
-	if strings.TrimSpace(direccion) != "" {
-		parts = append(parts, `<div class="center small">`+escapeHTML(direccion)+`</div>`)
-	}
-	if strings.TrimSpace(telefono) != "" {
-		parts = append(parts, `<div class="center small">Tel: `+escapeHTML(telefono)+`</div>`)
-	}
-	parts = append(parts,
-		`<div class="separator"></div>`,
-		`<div class="center bold">TICKET DE VENTA</div>`,
-		`<div class="center">Pedido: #`+escapeHTML(pedidoID)+`</div>`,
-		`<div class="center small">Mesa: `+escapeHTML(mesa)+`</div>`,
-	)
-	if strings.TrimSpace(solicitadoPor) != "" {
-		parts = append(parts, `<div class="center small">Solicito: `+escapeHTML(solicitadoPor)+`</div>`)
-	}
-	parts = append(parts,
-		`<div class="center small">Fecha: `+time.Now().Format("2006-01-02 15:04:05")+`</div>`,
-		`<div class="separator"></div>`,
-		`<div class="item-row bold"><div class="item-name">DESCRIPCION</div><div class="item-qty">CANT</div><div class="item-price">PRECIO</div></div>`,
-		detalles.String(),
-		`<div class="separator"></div>`,
-		`<div class="total-row"><div>TOTAL:</div><div>$`+fmt.Sprintf("%.2f", total)+`</div></div>`,
-	)
-	if strings.TrimSpace(mensaje) != "" {
-		parts = append(parts, `<div class="separator"></div><div class="center small">`+escapeHTML(mensaje)+`</div>`)
-	}
-	if strings.TrimSpace(leyenda) != "" {
-		parts = append(parts, `<div class="separator"></div><div class="footer">`+escapeHTML(leyenda)+`</div>`)
-	}
-	parts = append(parts, `<div class="center small" style="margin-top:15px;">GRACIAS POR SU PREFERENCIA!</div></div></body></html>`)
-	return strings.Join(parts, "")
-}
-
-// ── ESC/POS renderer ───────────────────────────────────────────────────
-
-const escposLineWidth = 48 // 80mm paper, Font A
-
-func renderTicketESCPOS(nombreComercial, direccion, telefono, pedidoID, mesa, solicitadoPor string, total float64, items []TicketItem, mensaje, leyenda, qrData string) []byte {
-	var b bytes.Buffer
-
-	// ESC/POS command helpers
-	init := []byte{0x1b, 0x40}                  // ESC @ — initialize
-	center := []byte{0x1b, 0x61, 0x01}           // ESC a 1
-	left := []byte{0x1b, 0x61, 0x00}             // ESC a 0
-	boldOn := []byte{0x1b, 0x45, 0x01}           // ESC E 1
-	boldOff := []byte{0x1b, 0x45, 0x00}          // ESC E 0
-	dblHeight := []byte{0x1b, 0x21, 0x10}        // double height
-	dblSize := []byte{0x1b, 0x21, 0x30}          // double width + height
-	normal := []byte{0x1b, 0x21, 0x00}           // normal
-	cut := []byte{0x1d, 0x56, 0x01}              // GS V 1 — partial cut
-	lf := []byte{0x0a}
-
-	separator := bytes.Repeat([]byte{'-'}, escposLineWidth)
-
-	// ── Initialize ──
-	b.Write(init)
-
-	// ── Header: business name (centered, bold, double height) ──
-	b.Write(center)
-	b.Write(dblHeight)
-	b.Write(boldOn)
-	b.Write([]byte(nombreComercial))
-	b.Write(lf)
-	b.Write(normal)
-	b.Write(boldOff)
-
-	if strings.TrimSpace(direccion) != "" {
-		b.Write([]byte(direccion))
-		b.Write(lf)
-	}
-	if strings.TrimSpace(telefono) != "" {
-		b.Write([]byte("Tel: " + telefono))
-		b.Write(lf)
-	}
-
-	// ── Separator ──
-	b.Write(separator)
-	b.Write(lf)
-
-	// ── Ticket title ──
-	b.Write(boldOn)
-	b.Write([]byte("TICKET DE VENTA"))
-	b.Write(lf)
-	b.Write(boldOff)
-
-	b.Write([]byte("Pedido: #" + pedidoID))
-	b.Write(lf)
-	b.Write([]byte("Mesa: " + mesa))
-	b.Write(lf)
-	if strings.TrimSpace(solicitadoPor) != "" {
-		b.Write([]byte("Solicito: " + solicitadoPor))
-		b.Write(lf)
-	}
-	b.Write([]byte("Fecha: " + time.Now().Format("2006-01-02 15:04:05")))
-	b.Write(lf)
-
-	// ── Separator ──
-	b.Write(separator)
-	b.Write(lf)
-
-	// ── Column header ──
-	b.Write(left)
-	b.Write(boldOn)
-	b.Write([]byte(escposColumns("DESCRIPCION", "CANT", "PRECIO")))
-	b.Write(lf)
-	b.Write(boldOff)
-
-	// ── Items ──
-	for _, item := range items {
-		qty := strconv.Itoa(item.Cantidad)
-		price := fmt.Sprintf("$%.2f", item.Subtotal)
-		b.Write([]byte(escposColumns(item.Nombre, qty, price)))
-		b.Write(lf)
-
-		for _, ex := range item.Extras {
-			exQty := strconv.Itoa(ex.Cantidad)
-			exPrice := fmt.Sprintf("$%.2f", ex.Precio)
-			exName := "  + " + exQty + "x " + ex.Nombre
-			b.Write([]byte(escposColumnsExtra(exName, exPrice)))
-			b.Write(lf)
-		}
-
-		if strings.TrimSpace(item.Observacion) != "" {
-			b.Write([]byte("  Obs: " + item.Observacion))
-			b.Write(lf)
-		}
-	}
-
-	if len(items) == 0 {
-		b.Write([]byte("(sin detalles)"))
-		b.Write(lf)
-	}
-
-	// ── Separator ──
-	b.Write(separator)
-	b.Write(lf)
-
-	// ── Total (bold, double size) ──
-	b.Write(center)
-	b.Write(dblSize)
-	b.Write(boldOn)
-	b.Write([]byte(fmt.Sprintf("TOTAL: $%.2f", total)))
-	b.Write(lf)
-	b.Write(normal)
-	b.Write(boldOff)
-
-	// ── Separator ──
-	b.Write(separator)
-	b.Write(lf)
-
-	// ── Footer messages ──
-	if strings.TrimSpace(mensaje) != "" {
-		b.Write([]byte(mensaje))
-		b.Write(lf)
-	}
-	if strings.TrimSpace(leyenda) != "" {
-		b.Write([]byte(leyenda))
-		b.Write(lf)
-	}
-
-	b.Write(lf)
-	b.Write([]byte("GRACIAS POR SU PREFERENCIA!"))
-	b.Write(lf)
-	b.Write(lf)
-
-	// ── QR Code (ESC/POS GS ( k) ──
-	if strings.TrimSpace(qrData) != "" {
-		b.Write(center)
-		// Select model 2
-		b.Write([]byte{0x1d, 0x28, 0x6b, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00})
-		// Set module size (8 = ~large)
-		b.Write([]byte{0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, 0x08})
-		// Error correction level M (49)
-		b.Write([]byte{0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x45, 0x31})
-		// Store data: pL+pH*256 = len(qrData)+3
-		dataLen := len(qrData) + 3
-		pL := byte(dataLen & 0xFF)
-		pH := byte((dataLen >> 8) & 0xFF)
-		b.Write([]byte{0x1d, 0x28, 0x6b, pL, pH, 0x31, 0x50, 0x30})
-		b.Write([]byte(qrData))
-		// Print stored QR
-		b.Write([]byte{0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x51, 0x30})
-		b.Write(lf)
-		b.Write(lf)
-		b.Write(left)
-	}
-
-	b.Write(lf)
-	b.Write(lf)
-
-	// ── Cut ──
-	b.Write(cut)
-
-	return b.Bytes()
-}
-
-// ── ZPL renderer ───────────────────────────────────────────────────────
-
-func renderTicketZPL(nombreComercial, direccion, telefono, pedidoID, mesa, solicitadoPor string, total float64, items []TicketItem, mensaje, leyenda, qrData string) []byte {
-	var b strings.Builder
-	y := 20
-
-	w := func(s string) { b.WriteString(s) }
-	line := func(label string, fontSize, fontW int) {
-		w(fmt.Sprintf("^FO10,%d^A0N,%d,%d^FD%s^FS", y, fontSize, fontW, zplSafe(label)))
-		y += fontSize + 6
-	}
-	sep := func() {
-		w(fmt.Sprintf("^FO10,%d^GB556,1,2^FS", y))
-		y += 8
-	}
-
-	// Header placeholder — label length set at the end
-	// ^PW640 = 80mm at 203 DPI (RIBETEC standard)
-	w("^XA^PW640")
-
-	// ── Header ──
-	line(nombreComercial, 28, 16)
-	if strings.TrimSpace(direccion) != "" {
-		line(direccion, 18, 10)
-	}
-	if strings.TrimSpace(telefono) != "" {
-		line("Tel: "+telefono, 18, 10)
-	}
-	sep()
-
-	// ── Order info ──
-	line("TICKET DE VENTA", 22, 12)
-	line("Pedido: #"+pedidoID, 18, 10)
-	line("Mesa: "+mesa, 18, 10)
-	if strings.TrimSpace(solicitadoPor) != "" {
-		line("Solicito: "+solicitadoPor, 18, 10)
-	}
-	line("Fecha: "+time.Now().Format("2006-01-02 15:04:05"), 18, 10)
-	sep()
-
-	// ── Column headers ──
-	w(fmt.Sprintf("^FO10,%d^A0N,18,10^FDDESCRIPCION^FS", y))
-	w(fmt.Sprintf("^FO400,%d^A0N,18,10^FDCANT^FS", y))
-	w(fmt.Sprintf("^FO500,%d^A0N,18,10^FDPRECIO^FS", y))
-	y += 24
-
-	// ── Items ──
-	for _, item := range items {
-		name := item.Nombre
-		if len(name) > 24 {
-			name = name[:24]
-		}
-		w(fmt.Sprintf("^FO10,%d^A0N,18,10^FD%s^FS", y, zplSafe(name)))
-		w(fmt.Sprintf("^FO400,%d^A0N,18,10^FD%d^FS", y, item.Cantidad))
-		w(fmt.Sprintf("^FO500,%d^A0N,18,10^FD$%.2f^FS", y, item.Subtotal))
-		y += 22
-		for _, ex := range item.Extras {
-			exName := "+ " + ex.Nombre
-			if len(exName) > 26 {
-				exName = exName[:26]
-			}
-			w(fmt.Sprintf("^FO20,%d^A0N,16,9^FD%s^FS", y, zplSafe(exName)))
-			w(fmt.Sprintf("^FO500,%d^A0N,16,9^FD$%.2f^FS", y, ex.Precio))
-			y += 20
-		}
-		if strings.TrimSpace(item.Observacion) != "" {
-			w(fmt.Sprintf("^FO20,%d^A0N,16,9^FDObs: %s^FS", y, zplSafe(item.Observacion)))
-			y += 20
-		}
-	}
-	if len(items) == 0 {
-		line("(sin detalles)", 18, 10)
-	}
-	sep()
-
-	// ── Total ──
-	w(fmt.Sprintf("^FO10,%d^A0N,28,16^FDTOTAL: $%.2f^FS", y, total))
-	y += 36
-
-	// ── Footer ──
-	if strings.TrimSpace(mensaje) != "" {
-		line(mensaje, 18, 10)
-	}
-	if strings.TrimSpace(leyenda) != "" {
-		line(leyenda, 16, 9)
-	}
-	line("GRACIAS POR SU PREFERENCIA!", 18, 10)
-	y += 6
-
-	// ── QR Code ──
-	if strings.TrimSpace(qrData) != "" {
-		w(fmt.Sprintf("^FO180,%d^BQN,2,5^FDLA,%s^FS", y, zplSafe(qrData)))
-		y += 130
-	}
-
-	w("^XZ")
-
-	// Inject ^LL (label length) after ^PW576
-	labelLen := y + 20
-	full := strings.Replace(b.String(), "^XA^PW640", fmt.Sprintf("^XA^PW640^LL%d^MNY", labelLen), 1)
-	return []byte(full)
-}
-
 func zplSafe(s string) string {
 	s = strings.ReplaceAll(s, "^", "")
 	s = strings.ReplaceAll(s, "~", "")
 	return s
-}
-
-// escposColumns formats a 3-column row: name (flexible) | qty (6 chars) | price (10 chars)
-func escposColumns(name, qty, price string) string {
-	const qtyW = 6
-	const priceW = 10
-	nameW := escposLineWidth - qtyW - priceW
-	if len(name) > nameW {
-		name = name[:nameW]
-	}
-	return fmt.Sprintf("%-*s%*s%*s", nameW, name, qtyW, qty, priceW, price)
-}
-
-// escposColumnsExtra formats a 2-column row for extras: name (left) | price (right-aligned)
-func escposColumnsExtra(name, price string) string {
-	const priceW = 10
-	nameW := escposLineWidth - priceW
-	if len(name) > nameW {
-		name = name[:nameW]
-	}
-	return fmt.Sprintf("%-*s%*s", nameW, name, priceW, price)
-}
-
-func escapeHTML(value string) string {
-	replacer := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&#39;")
-	return replacer.Replace(value)
 }
 
 func loadDotEnv(path string) {
@@ -1294,27 +923,6 @@ func intFromAny(v any) int {
 	case string:
 		i, _ := strconv.Atoi(strings.TrimSpace(x))
 		return i
-	default:
-		return 0
-	}
-}
-
-func numberFromAny(v any) float64 {
-	switch x := v.(type) {
-	case float64:
-		return x
-	case float32:
-		return float64(x)
-	case int:
-		return float64(x)
-	case int64:
-		return float64(x)
-	case json.Number:
-		f, _ := x.Float64()
-		return f
-	case string:
-		f, _ := strconv.ParseFloat(strings.TrimSpace(x), 64)
-		return f
 	default:
 		return 0
 	}
