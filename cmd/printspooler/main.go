@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,6 +34,12 @@ import (
 	"golang.org/x/image/math/fixed"
 
 	qrcode "github.com/skip2/go-qrcode"
+)
+
+var (
+	liberationSansRegular *opentype.Font
+	liberationSansBold    *opentype.Font
+	liberationFontsOnce   sync.Once
 )
 
 type Config struct {
@@ -50,6 +57,7 @@ type Config struct {
 	RequestTimeout   time.Duration
 	RenderMode       string
 	LogoImagePath    string
+	QRSizeDots       int // tamaño del QR en puntos (ancho etiqueta 812). En .env: QR_SIZE_DOTS=700
 }
 
 type LoginResponse struct {
@@ -192,6 +200,13 @@ func loadConfig() (Config, error) {
 		LogJSONPayload: strings.EqualFold(strings.TrimSpace(os.Getenv("LOG_JSON_PAYLOAD")), "true"),
 		RenderMode:     defaultString(strings.TrimSpace(os.Getenv("RENDER_MODE")), "zpl"),
 		LogoImagePath:  defaultString(strings.TrimSpace(os.Getenv("LOGO_IMAGE_PATH")), "./cmd/printspooler/logo.png"),
+		QRSizeDots:     parseIntOrDefault(os.Getenv("QR_SIZE_DOTS"), 530),
+	}
+	if cfg.QRSizeDots < 200 {
+		cfg.QRSizeDots = 200
+	}
+	if cfg.QRSizeDots > 812 {
+		cfg.QRSizeDots = 812
 	}
 
 	if cfg.BackendURL == "" {
@@ -422,7 +437,7 @@ func printTicket(cfg Config, jobID int64, doc TicketDoc) error {
 	case "command":
 		var cmd *exec.Cmd
 		if runtime.GOOS == "windows" {
-			cmd = exec.Command("powershell", "-NoProfile", "-Command", cfg.PrintCommand)
+			cmd = exec.Command("cmd", "/c", cfg.PrintCommand)
 		} else {
 			cmd = exec.Command("sh", "-c", cfg.PrintCommand)
 		}
@@ -501,18 +516,33 @@ func renderEtiquetaEnvioZPL(cfg Config, payload map[string]any) []byte {
 		destino = " -- "
 	}
 
+	// pt a dots @203dpi con factor 0.55 para que el tamano en etiqueta sea similar al original (no tan grande)
+	ptToDots := func(pt int) int { return int(float64(pt) * 203 / 72 * 0.25) }
+	// Proporciones PDF: folio 40pt, tipo 48/34/26pt, medidas 28pt, cliente 30pt, ruta 40pt
+	folioH, folioW := ptToDots(40), ptToDots(20)
+	tipoH48, tipoW48 := ptToDots(48), ptToDots(24)
+	tipoH34, tipoW34 := ptToDots(34), ptToDots(17)
+	tipoH26, tipoW26 := ptToDots(26), ptToDots(13)
+	medidasH, medidasW := ptToDots(28), ptToDots(14)
+	clienteH, clienteW := ptToDots(30), ptToDots(15)
+	rutaH, rutaW := ptToDots(40), ptToDots(20)
+	sobrepesoH, sobrepesoW := ptToDots(40), ptToDots(20)
+
 	var b strings.Builder
-	// 4x6 thermal label @203dpi => ~812 x 1218 dots; contenido bien ensanchado en X
 	labelWidth := 812
 	labelHeight := 1218
-	leftMargin := 15 // margen mínimo para ensanchar al máximo el contenido
+	leftMargin := 15
 	y := 20
 	w := func(s string) { b.WriteString(s) }
 	centerLine := func(text string, fontH, fontW int) {
 		w(fmt.Sprintf("^FO0,%d^A0N,%d,%d^FB%d,1,0,C,0^FD%s^FS", y, fontH, fontW, labelWidth, zplSafe(text)))
 		y += fontH + 8
 	}
-	// Menos espacio entre líneas (para bloque tipo producto / peso / medidas)
+	centerLineBold := func(text string, fontH, fontW int) {
+		w(fmt.Sprintf("^FO0,%d^A0N,%d,%d^FB%d,1,0,C,0^FD%s^FS", y, fontH, fontW, labelWidth, zplSafe(text)))
+		w(fmt.Sprintf("^FO1,%d^A0N,%d,%d^FB%d,1,0,C,0^FD%s^FS", y, fontH, fontW, labelWidth, zplSafe(text)))
+		y += fontH + 8
+	}
 	centerLineCompact := func(text string, fontH, fontW int) {
 		w(fmt.Sprintf("^FO0,%d^A0N,%d,%d^FB%d,1,0,C,0^FD%s^FS", y, fontH, fontW, labelWidth, zplSafe(text)))
 		y += fontH + 4
@@ -521,7 +551,6 @@ func renderEtiquetaEnvioZPL(cfg Config, payload map[string]any) []byte {
 		w(fmt.Sprintf("^FO%d,%d^A0N,%d,%d^FD%s^FS", leftMargin, y, fontH, fontW, zplSafe(text)))
 		y += fontH + 8
 	}
-	// Negrita mismo tamaño que leftLine: dos pasadas con 1 dot de desplazamiento
 	leftLineBold := func(text string, fontH, fontW int) {
 		w(fmt.Sprintf("^FO%d,%d^A0N,%d,%d^FD%s^FS", leftMargin, y, fontH, fontW, zplSafe(text)))
 		w(fmt.Sprintf("^FO%d,%d^A0N,%d,%d^FD%s^FS", leftMargin+1, y, fontH, fontW, zplSafe(text)))
@@ -530,7 +559,7 @@ func renderEtiquetaEnvioZPL(cfg Config, payload map[string]any) []byte {
 
 	w("^XA^CI28^PW812") // ^CI28 = UTF-8 para que salgan bien acentos (é, á, ñ, etc.)
 	logoWidth := 420
-	logoHeight := 200 // alargado en Y (antes 120)
+	logoHeight := 150 // alargado en Y (antes 120)
 	logoX := (labelWidth - logoWidth) / 2
 	logoY := 20
 	logoCmd := buildLogoGFACommand(cfg.LogoImagePath, logoX, logoY, logoWidth, logoHeight)
@@ -538,54 +567,114 @@ func renderEtiquetaEnvioZPL(cfg Config, payload map[string]any) []byte {
 		w(logoCmd)
 	} else {
 		y = 55
-		centerLine("PUEBLA EXPRESS", 48, 26)
+		centerLine("PUEBLA EXPRESS", tipoH48, tipoW48)
 	}
 
-	// Logo → folio → QR (subido en Y); luego gap → tipo producto → peso → medidas → Cliente
-	y = logoY + logoHeight + 0 // sin hueco para subir folio y QR
-	centerLine(folio, 72, 50)
-	y += 0 // QR pegado al folio para subirlo más
-	qrY := y
-	qrSize := 380
+	// Logo → folio → QR (misma fuente que PDF: Liberation Sans = Helvetica)
+	y = logoY + logoHeight + 0
+	if cmd, usedH := buildHelveticaGFA(folio, 0, y, labelWidth, folioH, true, true, 14); cmd != "" {
+		w(cmd)
+		y += usedH + 2
+	} else {
+		centerLineBold(folio, folioH, folioW)
+	}
+	qrY := y - 70
+	qrSize := cfg.QRSizeDots
 	qrX := (labelWidth - qrSize) / 2
+	log.Printf("[ZPL QR] folio=%s qrSize_dots=%d qrX=%d qrY=%d (cfg.QRSizeDots=%d)", folio, qrSize, qrX, qrY, cfg.QRSizeDots)
 	qrGFA := buildQRGFA(folio, qrX, qrY, qrSize)
 	if qrGFA != "" {
+		log.Printf("[ZPL QR] usando ^GFA (len=%d) size=%d dots", len(qrGFA), qrSize)
 		w(qrGFA)
 	} else {
+		log.Printf("[ZPL QR] buildQRGFA fallo, usando fallback ^BQN (tamano fijo, pequeno)")
 		w(fmt.Sprintf("^FO%d,%d^BQN,2,10^FDLA,%s^FS", qrX, qrY, zplSafe(folio)))
 	}
-	// PDF: después del QR hace y += 120 (QR 105mm + 15mm gap). En 4x6" ~24 dots de gap.
-	y = qrY + qrSize + 24
-	// Tipo de producto debajo del QR; padding top generoso para que no se corten las letras por arriba
-	if cmd := buildBoldTextGFA(tipoProducto, 0, y, labelWidth, 50, true, 20); cmd != "" {
+	y = qrY + qrSize - 50
+	lon := len(tipoProducto)
+	tipoH, tipoW := tipoH48, tipoW48
+	if lon > 35 {
+		tipoH, tipoW = tipoH26, tipoW26
+	} else if lon > 20 {
+		tipoH, tipoW = tipoH34, tipoW34
+	}
+	if cmd, usedH := buildHelveticaGFA(tipoProducto, 0, y, labelWidth, tipoH, true, true, 14); cmd != "" {
 		w(cmd)
-		y += 70 + 6 // 50+20 altura GFA + espacio
+		y += usedH + 4
+	} else if cmd := buildBoldTextGFA(tipoProducto, 0, y, labelWidth, tipoH, true, 12); cmd != "" {
+		w(cmd)
+		y += tipoH + 12
 	} else {
-		w(fmt.Sprintf("^FO0,%d^A0N,48,30^FB%d,1,0,C,0^FD%s^FS", y, labelWidth, zplSafe(tipoProducto)))
-		y += 48 + 6
+		w(fmt.Sprintf("^FO0,%d^A0N,%d,%d^FB%d,1,0,C,0^FD%s^FS", y, tipoH, tipoW, labelWidth, zplSafe(tipoProducto)))
+		y += tipoH + 6
 	}
-	// Peso (PDF: mismo tamaño que tipo, luego y += 10)
 	if !esPieza && peso != "" {
-		centerLineCompact(peso, 40, 22)
+		tipoLower := strings.ToLower(tipoProducto)
+		mostrarLbs := tipoLower == "libras" || strings.Contains(tipoLower, "cotizacion") || strings.Contains(tipoLower, "cotización")
+		textoPeso := peso
+		if mostrarLbs {
+			textoPeso = peso + " LBS"
+		}
+		if cmd, usedH := buildHelveticaGFA(textoPeso, 0, y, labelWidth, tipoH, true, true, 14); cmd != "" {
+			w(cmd)
+			y += usedH + 0
+		} else if mostrarLbs {
+			centerLineBold(textoPeso, tipoH, tipoW)
+		} else {
+			centerLineCompact(textoPeso, tipoH, tipoW)
+		}
 	}
-	// Medidas (PDF: font 20, y += 10)
 	if alto != "" || largo != "" || ancho != "" {
-		centerLineCompact(fmt.Sprintf(`%s" x %s" x %s"`, alto, largo, ancho), 34, 24)
+		medidasStr := fmt.Sprintf(`%s" x %s" x %s"`, alto, largo, ancho)
+		if cmd, usedH := buildHelveticaGFA(medidasStr, 0, y, labelWidth, medidasH, true, false, 8); cmd != "" {
+			w(cmd)
+			y += usedH + 0
+		} else {
+			centerLineCompact(medidasStr, medidasH, medidasW)
+		}
 	}
-	y += 16 // PDF: espacio antes del bloque Cliente (padding top)
-	leftLine("Cliente: "+cliente, 50, 32)
+	y += 20
+	lineW := labelWidth - leftMargin
+	tryLeft := func(text string, bold bool, topPad int) bool {
+		h := clienteH
+		if bold {
+			h = rutaH
+		}
+		if cmd, usedH := buildHelveticaGFA(text, leftMargin, y, lineW, h, false, bold, topPad); cmd != "" {
+			w(cmd)
+			y += usedH + 4
+			return true
+		}
+		return false
+	}
+	if !tryLeft("Cliente: "+cliente, false, 8) {
+		leftLine("Cliente: "+cliente, clienteH, clienteW)
+	}
 	if esDomicilio {
-		leftLine("Domicilio: "+destino, 46, 28)
+		if !tryLeft("Domicilio: "+destino, false, 8) {
+			leftLine("Domicilio: "+destino, clienteH, clienteW)
+		}
 	} else {
-		leftLine("Sucursal: "+destino, 46, 28)
+		if !tryLeft("Sucursal: "+destino, false, 8) {
+			leftLine("Sucursal: "+destino, clienteH, clienteW)
+		}
 	}
-	leftLine("Estado: "+estado, 46, 28)
-	leftLine("Municipio: "+municipio, 46, 28)
-	leftLine("Bodega descarga: PUE", 46, 28)
-	// Ruta mismo tamaño que Cliente (50, 32) pero en negrita
-	leftLineBold("Ruta: "+ruta, 50, 32)
+	if !tryLeft("Estado: "+estado, false, 8) {
+		leftLine("Estado: "+estado, clienteH, clienteW)
+	}
+	if !tryLeft("Municipio: "+municipio, false, 8) {
+		leftLine("Municipio: "+municipio, clienteH, clienteW)
+	}
+	if !tryLeft("Bodega descarga: PUE", false, 8) {
+		leftLine("Bodega descarga: PUE", clienteH, clienteW)
+	}
+	if !tryLeft("Ruta: "+ruta, true, 14) {
+		leftLineBold("Ruta: "+ruta, rutaH, rutaW)
+	}
 	if sobrepeso {
-		leftLine("Sobrepeso", 58, 36)
+		if !tryLeft("Sobrepeso", true, 8) {
+			leftLine("Sobrepeso", sobrepesoH, sobrepesoW)
+		}
 	}
 
 	labelLen := y + 40
@@ -649,20 +738,24 @@ func buildLogoGFACommand(path string, x, y, targetW, targetH int) string {
 // buildQRGFA genera un QR del contenido como gráfico ^GFA para fijar tamaño (p. ej. igual que etiqueta original).
 func buildQRGFA(content string, x, y, size int) string {
 	if size <= 0 || content == "" {
+		log.Printf("[ZPL QR buildQRGFA] skip: size=%d content_empty=%v", size, content == "")
 		return ""
 	}
 	pngBytes, err := qrcode.Encode(content, qrcode.Medium, size)
 	if err != nil {
+		log.Printf("[ZPL QR buildQRGFA] qrcode.Encode error: size=%d err=%v", size, err)
 		return ""
 	}
 	img, _, err := image.Decode(bytes.NewReader(pngBytes))
 	if err != nil {
+		log.Printf("[ZPL QR buildQRGFA] image.Decode error: size=%d err=%v", size, err)
 		return ""
 	}
 	bounds := img.Bounds()
 	srcW := bounds.Dx()
 	srcH := bounds.Dy()
 	if srcW <= 0 || srcH <= 0 {
+		log.Printf("[ZPL QR buildQRGFA] bounds invalidos: size=%d srcW=%d srcH=%d", size, srcW, srcH)
 		return ""
 	}
 	bytesPerRow := (size + 7) / 8
@@ -823,6 +916,177 @@ func resolveLogoPath(raw string) string {
 		}
 	}
 	return ""
+}
+
+func resolveFontPath(filename string) string {
+	candidates := []string{
+		filepath.Join("./cmd/printspooler/fonts", filename),
+		filepath.Join("fonts", filename),
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(exeDir, "fonts", filename),
+			filepath.Join(exeDir, "cmd/printspooler/fonts", filename),
+		)
+	}
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		if abs, err := filepath.Abs(c); err == nil {
+			c = abs
+		}
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+	return ""
+}
+
+func loadLiberationFonts() {
+	liberationFontsOnce.Do(func() {
+		regularNames := []string{"Helvetica.ttf", "helvetica.ttf", "LiberationSans-Regular.ttf"}
+		boldNames := []string{"Helvetica-Bold.ttf", "helvetica-bold.ttf", "LiberationSans-Bold.ttf"}
+		for _, name := range regularNames {
+			p := resolveFontPath(name)
+			if p != "" {
+				data, err := os.ReadFile(p)
+				if err == nil {
+					liberationSansRegular, _ = opentype.Parse(data)
+					break
+				}
+			}
+		}
+		for _, name := range boldNames {
+			p := resolveFontPath(name)
+			if p != "" {
+				data, err := os.ReadFile(p)
+				if err == nil {
+					liberationSansBold, _ = opentype.Parse(data)
+					break
+				}
+			}
+		}
+		if liberationSansRegular != nil || liberationSansBold != nil {
+			log.Printf("fuente Helvetica cargada: regular=%v bold=%v", liberationSansRegular != nil, liberationSansBold != nil)
+		}
+	})
+}
+
+// buildTextGFAFromTTF renderiza texto con una fuente TTF y devuelve ^GFA y la altura real usada (para avanzar y).
+// Incluye espacio para descendentes (g, y, p) para que no se corten.
+func buildTextGFAFromTTF(text string, posX, posY, width, height int, center bool, topPadding int, f *opentype.Font) (string, int) {
+	if text == "" || width <= 0 || height <= 0 || f == nil {
+		return "", 0
+	}
+	if topPadding < 0 {
+		topPadding = 0
+	}
+	widthSafe := width - 6 // margen para no cortar por la derecha
+	if widthSafe < 20 {
+		widthSafe = width
+	}
+	pt := float64(height) * 0.72
+	if pt < 6 {
+		pt = 6
+	}
+	for pt >= 6 {
+		tryFace, err := opentype.NewFace(f, &opentype.FaceOptions{Size: pt, DPI: 203})
+		if err != nil {
+			return "", 0
+		}
+		drMeasure := &font.Drawer{Face: tryFace}
+		adv := drMeasure.MeasureString(text)
+		tryFace.Close()
+		if adv.Round() <= widthSafe {
+			break
+		}
+		pt *= 0.85
+	}
+	if pt < 6 {
+		pt = 6
+	}
+	face, err := opentype.NewFace(f, &opentype.FaceOptions{Size: pt, DPI: 203})
+	if err != nil {
+		return "", 0
+	}
+	defer face.Close()
+
+	ascent := face.Metrics().Ascent.Round()
+	descent := face.Metrics().Descent.Round()
+	if descent < 0 {
+		descent = -descent
+	}
+	bottomPad := descent + 6
+	if bottomPad < 10 {
+		bottomPad = 10
+	}
+	totalHeight := height + topPadding + bottomPad
+	img := image.NewRGBA(image.Rect(0, 0, width, totalHeight))
+	draw.Draw(img, img.Bounds(), &image.Uniform{color.White}, image.Point{}, draw.Src)
+
+	dr := &font.Drawer{
+		Dst:  img,
+		Src:  image.NewUniform(color.Black),
+		Face: face,
+	}
+	adv := dr.MeasureString(text)
+	advPx := adv.Round()
+	xPx := 0
+	if center && advPx < width {
+		xPx = (width - advPx) / 2
+	}
+	baselineY := topPadding + ascent + 4
+	if baselineY+descent+4 > totalHeight {
+		baselineY = totalHeight - descent - 4
+	}
+	dr.Dot = fixed.P(xPx, baselineY)
+	dr.DrawString(text)
+
+	bytesPerRow := (width + 7) / 8
+	data := make([]byte, bytesPerRow*totalHeight)
+	bounds := img.Bounds()
+	for yy := 0; yy < totalHeight; yy++ {
+		for xx := 0; xx < width; xx++ {
+			r, g, bb, a := img.At(bounds.Min.X+xx, bounds.Min.Y+yy).RGBA()
+			if a>>8 < 120 {
+				continue
+			}
+			r8 := float64(uint8(r >> 8))
+			g8 := float64(uint8(g >> 8))
+			b8 := float64(uint8(bb >> 8))
+			luma := 0.299*r8 + 0.587*g8 + 0.114*b8
+			if luma < 200 {
+				idx := yy*bytesPerRow + (xx / 8)
+				data[idx] |= 1 << uint(7-(xx%8))
+			}
+		}
+	}
+	total := len(data)
+	hexData := strings.ToUpper(hex.EncodeToString(data))
+	return fmt.Sprintf("^FO%d,%d^GFA,%d,%d,%d,%s^FS", posX, posY, total, total, bytesPerRow, hexData), totalHeight
+}
+
+// buildHelveticaGFA usa Liberation Sans/Helvetica si está en fonts/. topPad evita recorte en parte superior (ej. 14 para tipo/peso).
+// Devuelve (ZPL, alturaReal) o ("", 0).
+func buildHelveticaGFA(text string, posX, posY, width, height int, center, bold bool, topPad int) (string, int) {
+	loadLiberationFonts()
+	f := liberationSansRegular
+	if bold && liberationSansBold != nil {
+		f = liberationSansBold
+	} else if !bold && liberationSansRegular != nil {
+		f = liberationSansRegular
+	} else if bold && liberationSansBold == nil && liberationSansRegular != nil {
+		f = liberationSansRegular
+	}
+	if f == nil {
+		return "", 0
+	}
+	if topPad < 0 {
+		topPad = 8
+	}
+	return buildTextGFAFromTTF(text, posX, posY, width, height, center, topPad, f)
 }
 
 func zplSafe(s string) string {
